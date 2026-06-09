@@ -339,6 +339,18 @@ class AdvancedImageDenoiser:
             },
         }
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, method, strength=0.15, detail_recovery=0.35,
+                        luminance_strength=0.10, chroma_strength=0.30,
+                        patch_size=7, search_window=21, wavelet_level=3,
+                        blend_original=0.0, sharpen_mode="off",
+                        sharpen_amount=0.20, sharpen_radius=0.30):
+        # Workflows saved with the pre-overhaul node restore widget values
+        # by position, so e.g. the old sigma_spatial (default 75) lands in
+        # wavelet_level (max 6) and stock validation rejects the prompt.
+        # Accept everything here; denoise() clamps to valid ranges.
+        return True
+
     RETURN_TYPES = ("IMAGE", "STRING")
     RETURN_NAMES = ("image", "noise_report")
     FUNCTION = "denoise"
@@ -354,6 +366,25 @@ class AdvancedImageDenoiser:
                 patch_size=7, search_window=21, wavelet_level=3,
                 blend_original=0.0, sharpen_mode="off",
                 sharpen_amount=0.20, sharpen_radius=0.30):
+
+        # Clamp everything: stale workflows (old node version) can deliver
+        # out-of-range values positionally, and VALIDATE_INPUTS lets them
+        # through so the prompt isn't rejected outright.
+        clamp = lambda v, lo, hi: float(min(hi, max(lo, v)))
+        if method not in self.METHODS:
+            method = "smart_auto"
+        strength = clamp(strength, 0.0, 1.0)
+        detail_recovery = clamp(detail_recovery, 0.0, 1.0)
+        luminance_strength = clamp(luminance_strength, 0.0, 1.0)
+        chroma_strength = clamp(chroma_strength, 0.0, 1.0)
+        blend_original = clamp(blend_original, 0.0, 1.0)
+        patch_size = ensure_odd(clamp(patch_size, 3, 15), 3)
+        search_window = ensure_odd(clamp(search_window, 7, 35), 7)
+        wavelet_level = int(clamp(wavelet_level, 1, 6))
+        if sharpen_mode not in ("off", "unsharp_mask", "luminance_only"):
+            sharpen_mode = "off"
+        sharpen_amount = clamp(sharpen_amount, 0.0, 1.0)
+        sharpen_radius = clamp(sharpen_radius, 0.05, 1.0)
 
         results = []
         reports = []

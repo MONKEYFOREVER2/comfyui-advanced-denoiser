@@ -309,6 +309,26 @@ app.registerExtension({
             if (w) { w.value = v; w.callback?.(v); }
         };
 
+        /* Repair values from workflows saved with the old node version:
+           widget values restore by position, so removed params (e.g.
+           sigma_spatial, default 75) land in today's params (wavelet_level,
+           max 6) and old method names no longer exist. */
+        function sanitize() {
+            for (const [name, m] of Object.entries(SLIDERS)) {
+                const w = getW(node, name);
+                if (!w) continue;
+                let v = Number(w.value);
+                if (!Number.isFinite(v)) v = m.min;
+                v = Math.min(m.max, Math.max(m.min, v));
+                if (m.int) v = Math.round(v);
+                if (v !== w.value) setVal(name, v);
+            }
+            const mw = getW(node, "method");
+            if (mw && !(mw.value in METHODS)) setVal("method", "smart_auto");
+            const sw = getW(node, "sharpen_mode");
+            if (sw && !(sw.value in SHARPEN_MODES)) setVal("sharpen_mode", "off");
+        }
+
         /* sliders → widgets */
         for (const name of Object.keys(SLIDERS)) {
             const row = el.querySelector(`[data-row="${name}"]`);
@@ -393,10 +413,10 @@ app.registerExtension({
         const origConfigure = node.onConfigure;
         node.onConfigure = function (...args) {
             const r = origConfigure?.apply(this, args);
-            setTimeout(refresh, 60);
+            setTimeout(() => { sanitize(); refresh(); }, 60);
             return r;
         };
 
-        setTimeout(refresh, 60);
+        setTimeout(() => { sanitize(); refresh(); }, 60);
     },
 });
