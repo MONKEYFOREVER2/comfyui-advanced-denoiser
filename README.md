@@ -1,160 +1,77 @@
 # 🧹 Advanced Image Denoiser — ComfyUI Custom Node
 
-A premium ComfyUI custom node for image denoising with **6 algorithms**, a **dark neon-themed UI**, **separate luminance/chrominance control**, and **built-in sharpening**.
+Edge-preserving image denoising that removes noise **without making the image blurry**.
 
-![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom_Node-purple?style=for-the-badge)
-![Python](https://img.shields.io/badge/Python-3.10+-blue?style=for-the-badge)
-![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+The node measures the actual noise level of your image (wavelet-based sigma
+estimation) and, in `smart_auto` mode, applies just enough denoising to remove
+it — no more. An edge-aware **detail recovery** pass then restores fine texture
+from the original image along edges only, so flat areas stay clean while
+detail stays sharp.
 
----
+The node ships with a **custom UI panel** (slate/teal theme): a segmented
+method picker with per-method descriptions, contextual sliders that only show
+the parameters the selected method uses, and a collapsible advanced section.
+All values sync to the standard widgets, so saved workflows and API use keep
+working.
 
-## 📦 Installation
+## Installation
 
-### Option 1: Git Clone (Recommended)
+1. Copy this folder into `ComfyUI/custom_nodes/comfyui-advanced-denoiser/`
+2. Install dependencies: `pip install -r requirements.txt`
+3. Optional, highest quality: `pip install bm3d`
+4. Restart ComfyUI — the node is under **image → denoising**
 
-Open a terminal and navigate to your ComfyUI `custom_nodes` folder, then clone:
+## Methods
 
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/MONKEYFOREVER2/comfyui-advanced-denoiser.git
-```
+| Method | Best For | Notes |
+|--------|----------|-------|
+| 🤖 **smart_auto** | Most images — start here | Measures noise, auto-tunes NLM. `strength 0.5` = exactly the measured level |
+| 🔍 **non_local_means** | Photo grain, manual control | Separate luminance / chroma strength |
+| 🎯 **bilateral** | Portraits, hard edges | LAB-split, edge-preserving |
+| 🪞 **guided_filter** | Fast edge-preserving smoothing | Pure numpy implementation, no extra deps |
+| 〰️ **wavelet** | Fine grain | BayesShrink with per-channel auto sigma |
+| 📐 **total_variation** | Flat/synthetic/AI images | Chambolle TV — strong but keeps edges |
+| 🏆 **bm3d** | Maximum quality (slow) | Needs `pip install bm3d`; falls back to adaptive NLM |
+| ⚡ **median** | Salt-and-pepper artifacts | Impulse noise only |
 
-Then install the Python dependencies:
+## Quick Start
 
-```bash
-cd comfyui-advanced-denoiser
-pip install -r requirements.txt
-```
+1. Use **smart_auto** with `strength = 0.1–0.25` (yes, that low — higher over-smooths).
+2. Raise `detail_recovery` (0.3–0.6) to bring texture back — it's edge-aware, so it won't re-add noise.
+3. Color noise? Use **non_local_means** and push `chroma_strength` up (eyes barely notice chroma smoothing).
+4. The `noise_report` STRING output tells you the measured noise sigma per image — wire it to a text display node to see what the node detected.
 
-> **Note:** If you're using a virtual environment or portable ComfyUI, make sure to activate it first before running `pip install`.
+## Key parameters
 
-### Option 2: Manual Download
+- **strength** — keep LOW (default 0.15). In smart_auto, 0.5 applies exactly the
+  measured noise level; 1.0 doubles it.
+- **detail_recovery** — restores original high-frequency detail weighted by an
+  edge map computed from the *denoised* image, soft-thresholded against the
+  measured noise floor. Safe to raise.
+- **luminance_strength / chroma_strength** — manual methods only. Luminance
+  smoothing is what causes visible blur; chroma can go 2–3× higher safely.
+- **blend_original** — final mix with the untouched input (0.1–0.2 for a
+  natural look).
+- **sharpen_mode** — optional post-sharpen; `luminance_only` avoids color fringing.
 
-1. Click the green **Code** button on this page → **Download ZIP**
-2. Extract the ZIP into your `ComfyUI/custom_nodes/` folder
-3. Make sure the folder is named `comfyui-advanced-denoiser` (remove any `-main` suffix)
-4. Open a terminal in that folder and run: `pip install -r requirements.txt`
+## Requirements
 
-### Option 3: ComfyUI Manager
+- `opencv-python >= 4.8`
+- `scikit-image >= 0.21` (noise estimation, wavelet, TV — strongly recommended)
+- `numpy >= 1.24`
+- `bm3d` (optional — enables the bm3d method)
 
-Search for **"Advanced Image Denoiser"** in ComfyUI Manager and click Install.
+## Testing
 
-### After Installation
-
-**Restart ComfyUI.** The node will appear under **image → denoising → 🧹 Advanced Image Denoiser**.
-
----
-
-## 🔍 Finding the Node
-
-Right-click the canvas → **Add Node** → search for **"Advanced Image Denoiser"**
-Or navigate: **image** → **denoising** → **🧹 Advanced Image Denoiser**
-
----
-
-## 🎨 Features
-
-- **Premium dark-themed UI** with neon purple/green/orange accents
-- **6 denoising algorithms** with dynamic method-specific controls
-- **Separate luminance & chrominance** denoising (LAB color space)
-- **Detail preservation** via high-frequency blending
-- **3 sharpening modes** for post-denoise detail enhancement
-- **Batch processing** support
-- **Beginner-friendly** descriptions, star ratings, and tooltips for every setting
-
----
-
-## 🧪 Denoising Methods
-
-| Method | Rating | Best For |
-|--------|--------|----------|
-| ⚡ **Auto-Blend** | ★★★★★ | **Start here.** Smart combo of NLM + Bilateral |
-| 🔍 **NLM** | ★★★★☆ | Photos with grain/noise |
-| 🎯 **Bilateral** | ★★★★☆ | Portraits, architecture (sharp edges) |
-| 〰️ **Wavelet** | ★★★★☆ | Subtle, fine-grained noise |
-| ☁️ **Gaussian** | ★★★☆☆ | Quick, light smoothing |
-| ⚡ **Median** | ★★★☆☆ | Salt-and-pepper / digital artifacts |
-
----
-
-## ✨ Sharpening Modes
-
-Applied **after** denoising to recover fine detail:
-
-| Mode | Description |
-|------|-------------|
-| 🔪 **Unsharp Mask** | Classic sharpening — good for general detail |
-| 🔬 **High-Pass** | Extracts and boosts fine micro-detail (textures, pores, hair) |
-| 💡 **Luminance Only** | Sharpens brightness without color fringing — best for photos |
-
----
-
-## ⚙️ Parameters
-
-### Core Controls
-| Parameter | Range | Default | Description |
-|-----------|-------|---------|-------------|
-| **Strength** | 0–1 | 0.50 | Overall denoising intensity |
-| **Preserve Detail** | 0–1 | 0.70 | Blends sharp detail from original back in |
-
-### Channel Controls
-| Parameter | Range | Default | Description |
-|-----------|-------|---------|-------------|
-| **Luminance** | 0–1 | 0.50 | Brightness channel denoising |
-| **Chrominance** | 0–1 | 0.50 | Color channel denoising |
-
-### Method-Specific (shown/hidden dynamically)
-| Parameter | Methods | Description |
-|-----------|---------|-------------|
-| **Patch Size** | NLM, Auto-Blend | Comparison patch dimension |
-| **Search Window** | NLM, Auto-Blend | Area searched for similar patches |
-| **Sigma Spatial** | Bilateral, Auto-Blend | Spatial smoothing radius |
-| **Sigma Color** | Bilateral, Auto-Blend | Color similarity threshold |
-| **Wavelet Levels** | Wavelet | Decomposition depth |
-
-### Sharpening
-| Parameter | Range | Default | Description |
-|-----------|-------|---------|-------------|
-| **Amount** | 0–1 | 0.00 | Sharpening intensity |
-| **Radius** | 0.05–1 | 0.30 | Detail scale (low = micro-detail, high = edges) |
-
-### Blending
-| Parameter | Range | Default | Description |
-|-----------|-------|---------|-------------|
-| **Blend Original** | 0–1 | 0.00 | Mix denoised with original for natural results |
-
----
-
-## 🚀 Quick Start
-
-1. Add a **Load Image** node and connect it to **🧹 Advanced Image Denoiser**
-2. Connect the output to a **Preview Image** or **Save Image** node
-3. Start with **Auto-Blend** at `strength = 0.3`, `preserve_detail = 0.7`
-4. For subtle results, set `blend_original = 0.1–0.3`
-5. Enable **Luminance Only** sharpening at `amount = 0.2` for a final polish
+A standalone smoke test is included — run it with your ComfyUI venv python:
 
 ```
-[Load Image] ──→ [🧹 Advanced Image Denoiser] ──→ [Preview Image]
+python test_node.py
 ```
 
----
+It runs every method on a synthetic noisy batch and checks shapes, dtypes,
+value ranges, and that denoising actually reduces noise.
 
-## 📋 Requirements
+## License
 
-- **ComfyUI** (any recent version)
-- **Python** 3.10+
-- `opencv-python >= 4.8.0`
-- `scikit-image >= 0.21.0` *(optional — wavelet mode falls back to Gaussian if missing)*
-- `numpy >= 1.24.0`
-
----
-
-## 📄 License
-
-MIT — free for personal and commercial use.
-
----
-
-## 🙏 Credits
-
-Built with ❤️ by [MONKEYFOREVER2](https://github.com/MONKEYFOREVER2)
+MIT

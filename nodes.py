@@ -1,212 +1,249 @@
 """
 Advanced Image Denoiser — ComfyUI Custom Node
 ==============================================
-6 denoising algorithms with LAB-space luminance/chrominance control
-and high-frequency detail preservation.
+Edge-preserving denoising with automatic noise estimation.
+Removes noise WITHOUT making the image blurry:
+  - smart_auto measures the actual noise level and applies just enough
+    denoising (NLM on luminance, stronger on chroma).
+  - All methods support edge-aware detail recovery, which restores fine
+    texture from the original only where real detail exists (edges),
+    not in flat areas where it would re-inject noise.
 """
 
 import numpy as np
 import torch
 import cv2
 
+try:
+    from skimage.restoration import (
+        estimate_sigma,
+        denoise_wavelet,
+        denoise_tv_chambolle,
+    )
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+try:
+    import bm3d as _bm3d
+    HAS_BM3D = True
+except ImportError:
+    HAS_BM3D = False
+
+
+# ── Tensor conversion ─────────────────────────────────────────────────────
 
 def tensor_to_numpy(tensor):
-    """ComfyUI IMAGE [B,H,W,C] float32 0–1 → numpy [H,W,C] uint8 RGB."""
-    return np.clip(tensor[0].cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+    """ComfyUI IMAGE [H,W,C] float32 0–1 → numpy [H,W,C] uint8 RGB."""
+    return np.clip(tensor.cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
 
 
 def numpy_to_tensor(img):
-    """numpy [H,W,C] uint8 → ComfyUI IMAGE [1,H,W,C] float32 0–1."""
-    return torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
+    """numpy [H,W,C] uint8 → torch [H,W,C] float32 0–1."""
+    return torch.from_numpy(img.astype(np.float32) / 255.0)
 
 
 def ensure_odd(n, minimum=1):
-    """Clamp to >= minimum and ensure odd."""
     n = max(minimum, int(n))
     return n if n % 2 == 1 else n + 1
 
 
-def restore_detail(original, denoised, amount):
-    """Blend high-frequency detail from original back into denoised result."""
-    if amount <= 0.0:
+# ── Noise estimation ──────────────────────────────────────────────────────
+
+def estimate_noise_sigma(img_bgr):
+    """Estimate noise standard deviation (0–255 scale).
+
+    Uses skimage's wavelet-based estimator when available, otherwise
+    Immerkaer's fast Laplacian method.
+    """
+    if HAS_SKIMAGE:
+        sigma = estimate_sigma(
+            img_bgr.astype(np.float32) / 255.0,
+            channel_axis=-1, average_sigmas=True,
+        )
+        return float(sigma) * 255.0
+
+    # Immerkaer (1996): noise variance from a Laplacian convolution
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], np.float32)
+    conv = cv2.filter2D(gray, -1, kernel)
+    h, w = gray.shape
+    sigma = np.sum(np.abs(conv)) * np.sqrt(np.pi / 2.0) / (6.0 * (w - 2) * (h - 2))
+    return float(sigma)
+
+
+# ── Edge-aware detail recovery ────────────────────────────────────────────
+
+def recover_detail(original, denoised, amount, noise_sigma):
+    """Restore high-frequency detail from the original — but only along
+    edges and textured regions. Flat areas keep the denoised result so
+    noise is not re-injected (the flaw in naive unsharp-style blending).
+    """
+    if amount <= 0.005:
         return denoised
+
     orig_f = original.astype(np.float32)
     den_f = denoised.astype(np.float32)
-    blur = cv2.GaussianBlur(orig_f, (0, 0), sigmaX=3.0)
+
+    # High-frequency layer of the original
+    blur = cv2.GaussianBlur(orig_f, (0, 0), sigmaX=1.5)
     detail = orig_f - blur
-    return np.clip(den_f + detail * amount, 0, 255).astype(np.uint8)
+
+    # Edge map from the DENOISED image (clean gradients, no noise edges)
+    gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.GaussianBlur(np.sqrt(gx * gx + gy * gy), (0, 0), sigmaX=2.0)
+
+    # Soft threshold: weight 0 in flat areas, →1 where gradient clearly
+    # exceeds what the measured noise level could produce.
+    lo = max(2.0, noise_sigma * 2.0)
+    hi = lo * 4.0
+    weight = np.clip((mag - lo) / (hi - lo), 0.0, 1.0)
+    weight = weight[..., None]
+
+    out = den_f + detail * weight * amount
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# ── Per-Channel Denoising (for LAB split) ─────────────────────────────────
+# ── Guided filter (self-guided, pure numpy/cv2 — no contrib needed) ──────
 
-def denoise_channel(ch, method, strength, **p):
-    """Denoise a single grayscale channel."""
-    if strength <= 0.01:
-        return ch.copy()
-
-    if method == "nlm":
-        h = max(1.0, strength * 30.0)
-        tw = ensure_odd(p.get("patch_size", 7), 3)
-        sw = ensure_odd(p.get("search_window", 21), 7)
-        return cv2.fastNlMeansDenoising(
-            ch, None, h=h, templateWindowSize=tw, searchWindowSize=sw
-        )
-
-    elif method == "bilateral":
-        d = max(1, int(5 + strength * 20))
-        sc = p.get("sigma_color", 75.0)
-        ss = p.get("sigma_spatial", 75.0)
-        return cv2.bilateralFilter(ch, d, sc, ss)
-
-    elif method == "gaussian":
-        ks = ensure_odd(int(strength * 12), 1)
-        sigma = max(0.1, strength * 5.0)
-        return cv2.GaussianBlur(ch, (ks, ks), sigmaX=sigma)
-
-    elif method == "median":
-        ks = ensure_odd(int(strength * 10), 3)
-        ks = min(ks, 31)
-        return cv2.medianBlur(ch, ks)
-
-    return ch.copy()
+def guided_filter_gray(I, radius, eps):
+    """Classic He et al. guided filter, image guiding itself. I in 0–1."""
+    r = int(radius)
+    ksize = (2 * r + 1, 2 * r + 1)
+    mean_I = cv2.boxFilter(I, -1, ksize)
+    mean_II = cv2.boxFilter(I * I, -1, ksize)
+    var_I = mean_II - mean_I * mean_I
+    a = var_I / (var_I + eps)
+    b = mean_I - a * mean_I
+    mean_a = cv2.boxFilter(a, -1, ksize)
+    mean_b = cv2.boxFilter(b, -1, ksize)
+    return mean_a * I + mean_b
 
 
-def denoise_lab_split(img_bgr, method, lum_str, chroma_str, **params):
-    """Denoise in LAB space with separate luminance/chrominance strength."""
+def denoise_guided(img_bgr, lum_str, chroma_str):
+    """Edge-preserving guided-filter denoise in LAB space."""
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32) / 255.0
+    L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
+    if lum_str > 0.005:
+        # eps is squared-intensity scale (0–1 image): comparable to the
+        # noise variance it should smooth over.
+        eps = (0.01 + lum_str * 0.2) ** 2
+        L = guided_filter_gray(L, radius=2 + int(lum_str * 4), eps=eps)
+    if chroma_str > 0.005:
+        eps = (0.02 + chroma_str * 0.3) ** 2
+        r = 3 + int(chroma_str * 6)
+        A = guided_filter_gray(A, radius=r, eps=eps)
+        B = guided_filter_gray(B, radius=r, eps=eps)
+    lab = np.clip(np.stack([L, A, B], axis=-1) * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+# ── Denoise methods ───────────────────────────────────────────────────────
+
+def denoise_nlm(img_bgr, lum_str, chroma_str, patch_size, search_window):
+    """Non-Local Means. Strength maps to gentle h values: 0.1 → h≈4."""
+    h = lum_str * 40.0
+    h_c = chroma_str * 40.0
+    if h < 0.5 and h_c < 0.5:
+        return img_bgr.copy()
+    tw = ensure_odd(patch_size, 3)
+    sw = ensure_odd(search_window, 7)
+    return cv2.fastNlMeansDenoisingColored(
+        img_bgr, None, max(0.5, h), max(0.5, h_c), tw, sw
+    )
+
+
+def denoise_nlm_auto(img_bgr, strength, chroma_boost, patch_size, search_window):
+    """Noise-adaptive NLM: h derived from the measured noise level.
+
+    h = 1.15 * sigma is the standard heuristic; `strength` scales it
+    (1.0 = exactly the heuristic, lower = gentler).
+    """
+    sigma = estimate_noise_sigma(img_bgr)
+    h = 1.15 * sigma * strength * 2.0          # strength 0.5 = heuristic
+    h_c = h * chroma_boost                     # chroma can take more
+    if h < 0.5:
+        return img_bgr.copy(), sigma
+    tw = ensure_odd(patch_size, 3)
+    sw = ensure_odd(search_window, 7)
+    out = cv2.fastNlMeansDenoisingColored(
+        img_bgr, None, h, max(h, h_c), tw, sw
+    )
+    return out, sigma
+
+
+def denoise_bilateral(img_bgr, lum_str, chroma_str):
+    """Bilateral filter in LAB. Sigmas scale from strength — gentle by default."""
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
-
-    L = denoise_channel(L, method, lum_str, **params)
-    A = denoise_channel(A, method, chroma_str, **params)
-    B = denoise_channel(B, method, chroma_str, **params)
-
+    if lum_str > 0.005:
+        d = 5 + 2 * int(lum_str * 3)
+        L = cv2.bilateralFilter(L, d, sigmaColor=10 + lum_str * 60,
+                                sigmaSpace=10 + lum_str * 30)
+    if chroma_str > 0.005:
+        d = 7 + 2 * int(chroma_str * 3)
+        A = cv2.bilateralFilter(A, d, sigmaColor=10 + chroma_str * 80,
+                                sigmaSpace=10 + chroma_str * 40)
+        B = cv2.bilateralFilter(B, d, sigmaColor=10 + chroma_str * 80,
+                                sigmaSpace=10 + chroma_str * 40)
     return cv2.cvtColor(cv2.merge([L, A, B]), cv2.COLOR_LAB2BGR)
 
 
-# ── Full-Image Denoise Methods ───────────────────────────────────────────
-
-def denoise_nlm_color(img_bgr, lum_str, chroma_str, patch_size, search_window):
-    """Non-Local Means with native luminance/chrominance control.
-    Uses positional args for OpenCV 4.13+ compatibility."""
-    h = max(1.0, lum_str * 30.0)
-    h_c = max(1.0, chroma_str * 30.0)
-    tw = ensure_odd(patch_size, 3)
-    sw = ensure_odd(search_window, 7)
-    # Positional args: src, dst, h, hForColorComponents, templateWindowSize, searchWindowSize
-    return cv2.fastNlMeansDenoisingColored(img_bgr, None, h, h_c, tw, sw)
-
-
-def denoise_bilateral_full(img_bgr, strength, sigma_spatial, sigma_color):
-    """Bilateral filter on full BGR image."""
-    d = max(1, int(5 + strength * 20))
-    return cv2.bilateralFilter(img_bgr, d, sigma_color, sigma_spatial)
-
-
-def denoise_wavelet_full(img_bgr, strength, wavelet_level):
-    """Wavelet denoising (requires scikit-image; falls back to Gaussian)."""
-    try:
-        from skimage.restoration import denoise_wavelet as _sk_wav
-        from skimage import img_as_float, img_as_ubyte
-
-        rgb_f = img_as_float(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-        sigma = max(0.001, strength * 0.3)
-
-        out = _sk_wav(
-            rgb_f, method="BayesShrink", mode="soft",
-            wavelet_levels=wavelet_level, sigma=sigma,
-            channel_axis=-1, rescale_sigma=True
-        )
-        return cv2.cvtColor(img_as_ubyte(np.clip(out, 0, 1)), cv2.COLOR_RGB2BGR)
-
-    except ImportError:
-        print("[AdvancedDenoiser] scikit-image not available — Gaussian fallback")
-        ks = ensure_odd(int(strength * 12), 1)
-        return cv2.GaussianBlur(img_bgr, (ks, ks), sigmaX=max(0.1, strength * 5.0))
-
-
-def denoise_gaussian_full(img_bgr, strength):
-    """Simple Gaussian blur."""
-    if strength <= 0.01:
-        return img_bgr.copy()
-    ks = ensure_odd(int(strength * 12), 1)
-    return cv2.GaussianBlur(img_bgr, (ks, ks), sigmaX=max(0.1, strength * 5.0))
-
-
-def denoise_median_full(img_bgr, strength):
-    """Median filter for impulse noise."""
-    if strength <= 0.01:
-        return img_bgr.copy()
-    ks = ensure_odd(int(strength * 10), 3)
-    ks = min(ks, 31)
-    return cv2.medianBlur(img_bgr, ks)
-
-
-def denoise_auto_blend(img_bgr, strength, lum_str, chroma_str,
-                       preserve_detail, patch_size, search_window,
-                       sigma_spatial, sigma_color):
-    """Smart NLM + Bilateral blend weighted by preserve_detail."""
-    nlm = denoise_nlm_color(img_bgr, lum_str, chroma_str, patch_size, search_window)
-    bilateral = denoise_lab_split(
-        img_bgr, "bilateral", lum_str, chroma_str,
-        sigma_spatial=sigma_spatial, sigma_color=sigma_color
+def denoise_wavelet_img(img_bgr, strength, wavelet_level):
+    """Wavelet BayesShrink. sigma=None lets skimage auto-estimate per
+    channel; strength then scales the result by blending with the input."""
+    if not HAS_SKIMAGE:
+        print("[AdvancedDenoiser] scikit-image missing — using guided filter")
+        return denoise_guided(img_bgr, strength, strength)
+    rgb_f = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    out = denoise_wavelet(
+        rgb_f, method="BayesShrink", mode="soft",
+        wavelet_levels=int(wavelet_level), sigma=None,
+        channel_axis=-1, rescale_sigma=True,
     )
-    a = preserve_detail  # 0 → full NLM, 1 → full bilateral
-    return cv2.addWeighted(nlm, 1.0 - a, bilateral, a, 0)
+    # strength 1.0 = full wavelet result, lower blends toward original
+    mix = np.clip(strength * 2.0, 0.0, 1.0)
+    out = rgb_f * (1.0 - mix) + out * mix
+    out8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out8, cv2.COLOR_RGB2BGR)
 
 
-# ── Sharpening ───────────────────────────────────────────────────────────
-
-def sharpen_unsharp_mask(img_bgr, amount, radius):
-    """Classic unsharp mask sharpening.
-    amount: strength 0-1, radius: blur kernel sigma."""
-    if amount <= 0.01:
-        return img_bgr
-    sigma = max(0.5, radius * 3.0)
-    blurred = cv2.GaussianBlur(img_bgr.astype(np.float32), (0, 0), sigmaX=sigma)
-    sharpened = img_bgr.astype(np.float32) + amount * 2.0 * (img_bgr.astype(np.float32) - blurred)
-    return np.clip(sharpened, 0, 255).astype(np.uint8)
-
-
-def sharpen_high_pass(img_bgr, amount, radius):
-    """High-pass filter sharpening — great for fine micro-detail.
-    Extracts high frequencies and adds them back."""
-    if amount <= 0.01:
-        return img_bgr
-    sigma = max(0.5, radius * 5.0)
-    img_f = img_bgr.astype(np.float32)
-    low_pass = cv2.GaussianBlur(img_f, (0, 0), sigmaX=sigma)
-    high_pass = img_f - low_pass
-    result = img_f + high_pass * amount * 3.0
-    return np.clip(result, 0, 255).astype(np.uint8)
+def denoise_tv(img_bgr, strength):
+    """Total Variation (Chambolle) — removes noise while keeping edges
+    piecewise-smooth. Good for synthetic / cartoon-like images."""
+    if not HAS_SKIMAGE:
+        print("[AdvancedDenoiser] scikit-image missing — using guided filter")
+        return denoise_guided(img_bgr, strength, strength)
+    rgb_f = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    out = denoise_tv_chambolle(rgb_f, weight=strength * 0.2, channel_axis=-1)
+    out8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out8, cv2.COLOR_RGB2BGR)
 
 
-def sharpen_luminance_only(img_bgr, amount, radius):
-    """Sharpen only the luminance channel (LAB L) to avoid color fringing."""
-    if amount <= 0.01:
-        return img_bgr
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    sigma = max(0.5, radius * 3.0)
-    L_f = L.astype(np.float32)
-    blurred = cv2.GaussianBlur(L_f, (0, 0), sigmaX=sigma)
-    L_sharp = L_f + amount * 2.0 * (L_f - blurred)
-    L_out = np.clip(L_sharp, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(cv2.merge([L_out, A, B]), cv2.COLOR_LAB2BGR)
+def denoise_bm3d_img(img_bgr, strength):
+    """BM3D — best classical denoiser available. Slow but excellent.
+    Requires `pip install bm3d`; falls back to auto-NLM otherwise."""
+    sigma = estimate_noise_sigma(img_bgr)
+    if not HAS_BM3D:
+        print("[AdvancedDenoiser] bm3d not installed — using adaptive NLM "
+              "(pip install bm3d to enable)")
+        out, _ = denoise_nlm_auto(img_bgr, strength, 1.5, 7, 21)
+        return out
+    rgb_f = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    psd = max(0.5, sigma * strength * 2.0) / 255.0
+    out = _bm3d.bm3d_rgb(rgb_f, psd)
+    out8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out8, cv2.COLOR_RGB2BGR)
 
 
-def apply_sharpening(img_bgr, sharpen_mode, sharpen_amount, sharpen_radius):
-    """Dispatch to the correct sharpening method."""
-    if sharpen_mode == "off" or sharpen_amount <= 0.01:
-        return img_bgr
-    if sharpen_mode == "unsharp_mask":
-        return sharpen_unsharp_mask(img_bgr, sharpen_amount, sharpen_radius)
-    elif sharpen_mode == "high_pass":
-        return sharpen_high_pass(img_bgr, sharpen_amount, sharpen_radius)
-    elif sharpen_mode == "luminance_only":
-        return sharpen_luminance_only(img_bgr, sharpen_amount, sharpen_radius)
-    return img_bgr
+def denoise_median_img(img_bgr, strength):
+    """Median filter — only for salt-and-pepper / impulse noise."""
+    if strength <= 0.005:
+        return img_bgr.copy()
+    ks = ensure_odd(3 + int(strength * 6), 3)
+    return cv2.medianBlur(img_bgr, min(ks, 9))
 
 
 # ── ComfyUI Node ─────────────────────────────────────────────────────────
@@ -215,11 +252,13 @@ class AdvancedImageDenoiser:
     """🧹 Advanced Image Denoiser"""
 
     METHODS = [
-        "auto_blend",
+        "smart_auto",
         "non_local_means",
         "bilateral",
+        "guided_filter",
         "wavelet",
-        "gaussian",
+        "total_variation",
+        "bm3d",
         "median",
     ]
 
@@ -228,136 +267,166 @@ class AdvancedImageDenoiser:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "method": (cls.METHODS, {"default": "auto_blend"}),
-                "strength": ("FLOAT", {
-                    "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "display": "slider",
+                "method": (cls.METHODS, {
+                    "default": "smart_auto",
+                    "tooltip": "smart_auto measures the noise level and "
+                               "applies just enough denoising. bm3d is the "
+                               "highest quality (needs `pip install bm3d`).",
                 }),
-                "preserve_detail": ("FLOAT", {
-                    "default": 0.70, "min": 0.0, "max": 1.0, "step": 0.01,
+                "strength": ("FLOAT", {
+                    "default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01,
                     "display": "slider",
+                    "tooltip": "Keep this LOW (0.05–0.25). In smart_auto, "
+                               "0.5 applies exactly the measured noise level; "
+                               "higher over-smooths.",
+                }),
+                "detail_recovery": ("FLOAT", {
+                    "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "Edge-aware: restores fine texture from the "
+                               "original along edges only, so flat areas stay "
+                               "clean. Safe to raise.",
                 }),
             },
             "optional": {
                 "luminance_strength": ("FLOAT", {
-                    "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01,
                     "display": "slider",
+                    "tooltip": "Manual methods only. Brightness-channel "
+                               "denoising — keep low, this is what causes "
+                               "blur if overdone.",
                 }),
-                "color_strength": ("FLOAT", {
-                    "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01,
+                "chroma_strength": ("FLOAT", {
+                    "default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01,
                     "display": "slider",
+                    "tooltip": "Color-noise removal. Eyes are less sensitive "
+                               "to chroma blur, so this can be 2–3× higher "
+                               "than luminance.",
                 }),
                 "patch_size": ("INT", {
                     "default": 7, "min": 3, "max": 15, "step": 2,
+                    "tooltip": "NLM comparison patch (odd). 7 is standard.",
                 }),
                 "search_window": ("INT", {
                     "default": 21, "min": 7, "max": 35, "step": 2,
-                }),
-                "sigma_spatial": ("FLOAT", {
-                    "default": 75.0, "min": 1.0, "max": 300.0, "step": 1.0,
-                }),
-                "sigma_color": ("FLOAT", {
-                    "default": 75.0, "min": 1.0, "max": 300.0, "step": 1.0,
+                    "tooltip": "NLM search area (odd). Bigger = better but slower.",
                 }),
                 "wavelet_level": ("INT", {
-                    "default": 2, "min": 1, "max": 5, "step": 1,
+                    "default": 3, "min": 1, "max": 6, "step": 1,
+                    "tooltip": "Wavelet decomposition depth.",
                 }),
                 "blend_original": ("FLOAT", {
-                    "default": 0.00, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
                     "display": "slider",
+                    "tooltip": "Mix the untouched original back in for a "
+                               "natural look (0.1–0.2 is plenty).",
                 }),
-                "sharpen_mode": (["off", "unsharp_mask", "high_pass", "luminance_only"], {
+                "sharpen_mode": (["off", "unsharp_mask", "luminance_only"], {
                     "default": "off",
+                    "tooltip": "Optional post-sharpen. luminance_only avoids "
+                               "color fringing.",
                 }),
                 "sharpen_amount": ("FLOAT", {
-                    "default": 0.00, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "default": 0.20, "min": 0.0, "max": 1.0, "step": 0.01,
                     "display": "slider",
+                    "tooltip": "Sharpening intensity.",
                 }),
                 "sharpen_radius": ("FLOAT", {
                     "default": 0.30, "min": 0.05, "max": 1.0, "step": 0.01,
                     "display": "slider",
+                    "tooltip": "Detail scale: low = fine micro-detail.",
                 }),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "noise_report")
     FUNCTION = "denoise"
     CATEGORY = "image/denoising"
 
     DESCRIPTION = (
-        "Advanced image denoising with 6 algorithms, separate luminance/"
-        "chrominance control, detail preservation, and fine-detail sharpening."
+        "Edge-preserving denoising with automatic noise estimation and "
+        "edge-aware detail recovery — removes noise without blur."
     )
 
-    def denoise(self, image, method, strength, preserve_detail,
-                luminance_strength=0.5, color_strength=0.5,
-                patch_size=7, search_window=21,
-                sigma_spatial=75.0, sigma_color=75.0,
-                wavelet_level=2, blend_original=0.0,
-                sharpen_mode="off", sharpen_amount=0.0,
-                sharpen_radius=0.3):
-        """Process each image in the batch."""
+    def denoise(self, image, method, strength, detail_recovery,
+                luminance_strength=0.10, chroma_strength=0.30,
+                patch_size=7, search_window=21, wavelet_level=3,
+                blend_original=0.0, sharpen_mode="off",
+                sharpen_amount=0.20, sharpen_radius=0.30):
 
         results = []
+        reports = []
+
         for i in range(image.shape[0]):
-            img_np = tensor_to_numpy(image[i:i + 1])          # [H,W,C] RGB u8
+            img_np = tensor_to_numpy(image[i])
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
             original = img_bgr.copy()
 
-            # ── dispatch ──
-            if method == "non_local_means":
-                # NLM natively supports separate lum/chroma via h params
-                out = denoise_nlm_color(
-                    img_bgr, luminance_strength, color_strength,
-                    patch_size, search_window
-                )
+            sigma = estimate_noise_sigma(img_bgr)
 
+            if method == "smart_auto":
+                out, sigma = denoise_nlm_auto(
+                    img_bgr, strength, chroma_boost=1.8,
+                    patch_size=patch_size, search_window=search_window,
+                )
+            elif method == "non_local_means":
+                out = denoise_nlm(img_bgr, luminance_strength,
+                                  chroma_strength, patch_size, search_window)
             elif method == "bilateral":
-                # Per-channel LAB split for separate lum/chroma control
-                out = denoise_lab_split(
-                    img_bgr, "bilateral", luminance_strength, color_strength,
-                    sigma_spatial=sigma_spatial, sigma_color=sigma_color
-                )
-
+                out = denoise_bilateral(img_bgr, luminance_strength,
+                                        chroma_strength)
+            elif method == "guided_filter":
+                out = denoise_guided(img_bgr, luminance_strength,
+                                     chroma_strength)
             elif method == "wavelet":
-                out = denoise_wavelet_full(img_bgr, strength, wavelet_level)
-
-            elif method == "gaussian":
-                out = denoise_lab_split(
-                    img_bgr, "gaussian", luminance_strength, color_strength
-                )
-
+                out = denoise_wavelet_img(img_bgr, strength, wavelet_level)
+            elif method == "total_variation":
+                out = denoise_tv(img_bgr, strength)
+            elif method == "bm3d":
+                out = denoise_bm3d_img(img_bgr, strength)
             elif method == "median":
-                out = denoise_lab_split(
-                    img_bgr, "median", luminance_strength, color_strength
-                )
-
-            elif method == "auto_blend":
-                out = denoise_auto_blend(
-                    img_bgr, strength, luminance_strength, color_strength,
-                    preserve_detail, patch_size, search_window,
-                    sigma_spatial, sigma_color
-                )
+                out = denoise_median_img(img_bgr, strength)
             else:
                 out = img_bgr
 
-            # ── detail preservation ──
-            if preserve_detail > 0.0 and method != "auto_blend":
-                out = restore_detail(original, out, preserve_detail)
+            out = recover_detail(original, out, detail_recovery, sigma)
 
-            # ── blend with original ──
-            if blend_original > 0.0:
-                out = cv2.addWeighted(
-                    out, 1.0 - blend_original, original, blend_original, 0
-                )
+            if blend_original > 0.005:
+                out = cv2.addWeighted(out, 1.0 - blend_original,
+                                      original, blend_original, 0)
 
-            # ── sharpening (post-denoise) ──
-            if sharpen_mode != "off" and sharpen_amount > 0.01:
-                out = apply_sharpening(out, sharpen_mode, sharpen_amount, sharpen_radius)
+            if sharpen_mode != "off" and sharpen_amount > 0.005:
+                out = apply_sharpening(out, sharpen_mode,
+                                       sharpen_amount, sharpen_radius)
 
-            # ── back to RGB tensor ──
             out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
             results.append(numpy_to_tensor(out_rgb))
+            reports.append(
+                f"img {i}: noise sigma={sigma:.2f}/255 "
+                f"({'low' if sigma < 3 else 'moderate' if sigma < 8 else 'high'}), "
+                f"method={method}"
+            )
 
-        return (torch.cat(results, dim=0),)
+        return (torch.stack(results, dim=0), "\n".join(reports))
+
+
+# ── Sharpening ───────────────────────────────────────────────────────────
+
+def apply_sharpening(img_bgr, mode, amount, radius):
+    sigma = max(0.5, radius * 3.0)
+    if mode == "unsharp_mask":
+        img_f = img_bgr.astype(np.float32)
+        blurred = cv2.GaussianBlur(img_f, (0, 0), sigmaX=sigma)
+        out = img_f + amount * 1.5 * (img_f - blurred)
+        return np.clip(out, 0, 255).astype(np.uint8)
+    if mode == "luminance_only":
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        L, A, B = cv2.split(lab)
+        L_f = L.astype(np.float32)
+        blurred = cv2.GaussianBlur(L_f, (0, 0), sigmaX=sigma)
+        L_out = np.clip(L_f + amount * 1.5 * (L_f - blurred), 0, 255)
+        return cv2.cvtColor(
+            cv2.merge([L_out.astype(np.uint8), A, B]), cv2.COLOR_LAB2BGR
+        )
+    return img_bgr
